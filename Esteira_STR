@@ -1,0 +1,403 @@
+#include <stdio.h>
+#include <math.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "freertos/semphr.h"
+#include "driver/touch_pad.h"   // ESP32 clássico: driver legado
+#include "esp_timer.h"
+#include "esp_log.h"
+
+#define TAG "Trabalho M1"
+
+//===================== Touch pads (ajuste conforme seu hardware) ==============
+#define PAD_INJECAO_LOAD  TOUCH_PAD_NUM4   // GPIO13 - injeta carga (opcional)
+#define PAD_DETEC_OBJETO  TOUCH_PAD_NUM5   // GPIO12 - detecção de objeto
+#define PAD_HMI           TOUCH_PAD_NUM7   // GPIO27 - HMI/telemetria
+#define PAD_STOP          TOUCH_PAD_NUM9   // GPIO32 - E-stop
+
+#define THR_RATIO   0.80f       // Limiar HW = 80% do baseline filtrado
+#define FILTER_MS   10          // filtro por software
+#define THR_ABS     400         // Limiar SW adicional: < 400 = toque (A/B/D)
+#define DEBOUNCE_MS 120         // debounce por software
+
+//===================== Especificações temporais ===============================
+#define ENC_PERIOD_MS     5                    // ENC_SENSE: T=5ms
+#define ENC_BUDGET_MS     1                    // alvo ~0,6–1,0 ms
+#define ENC_DEADLINE_MS   (ENC_PERIOD_MS)      // 5 ms
+#define ENC_LOG_EVERY     100                  // log periódico de stats
+
+#define SPD_DEADLINE_MS  10    // SPD_CTRL após cada ENC_SENSE
+#define SORT_DEADLINE_MS 10    // SORT_ACT desde o toque B
+#define SAFE_DEADLINE_MS  5    // SAFETY_TASK desde o toque D
+
+//===================== Planta simulada / variáveis globais ====================
+typedef struct {
+    uint32_t t_ms;       // timestamp (ms) do sample
+    float    rpm_est;    // estimativa de RPM
+    float    pos_deg;    // posição 0..360 (simulada)
+} enc_sample_t;
+
+static volatile float g_pwm_duty = 0.0f;   // 0..1 (simulado)
+static volatile bool  g_alarm     = false; // alarme E-stop
+static volatile bool  g_hmi_flag  = false; // pedido de HMI (Touch C)
+static volatile uint32_t g_sort_pulses = 0;// pulsos de solenoide (produção)
+
+// Estatísticas em **ms**
+static uint32_t enc_sense_miss_counter = 0;
+static uint32_t enc_sense_c_ms_max = 0;
+static uint32_t enc_sense_c_ms_min = UINT32_MAX;
+
+static uint32_t spd_control_miss_counter = 0;
+static uint32_t spd_control_c_ms_max = 0;
+static uint32_t spd_control_c_ms_min = UINT32_MAX;
+
+static uint32_t sort_act_miss_counter = 0;
+static uint32_t sort_act_c_ms_max = 0;
+static uint32_t sort_act_c_ms_min = UINT32_MAX;
+
+static uint32_t safety_miss_counter = 0;
+static uint32_t safety_c_ms_max = 0;
+static uint32_t safety_c_ms_min = UINT32_MAX;
+
+//===================== RTOS objects ===========================================
+static TaskHandle_t   sENC  = NULL;
+static TaskHandle_t   sSPD  = NULL;
+static TaskHandle_t   sSORT = NULL;
+static TaskHandle_t   sSAFE = NULL;
+static TaskHandle_t   sLOAD = NULL;
+
+static QueueHandle_t  qENCtoSPD = NULL;  // ENC_SENSE -> SPD_CTRL
+static QueueHandle_t  qSORTevt   = NULL; // eventos Touch B (timestamp ms)
+static SemaphoreHandle_t semLoad = NULL; // tokens de carga (Touch A)
+
+// debounce por PAD
+typedef struct { uint32_t last_ms; } touch_state_t;
+static touch_state_t stA={0}, stB={0}, stC={0}, stD={0};
+
+// esp_timer para 5 ms do ENC_SENSE
+static esp_timer_handle_t sEncTimer = NULL;
+
+//===================== utilidades =============================================
+static inline uint32_t now_ms(void) {
+    return (uint32_t)(esp_timer_get_time() / 1000ULL); // micros -> ms
+}
+
+//===================== ISR dos touch pads =====================================
+static void IRAM_ATTR touch_isr(void *arg)
+{
+    uint32_t mask = touch_pad_get_status();
+    touch_pad_clear_status();
+
+    uint16_t filt;
+    uint32_t t = now_ms();
+
+    // Macro com opção de usar ou não o THR_ABS
+    #define HANDLE_PAD(_PAD, _st, _use_abs, _onhit) do {                \
+        if (mask & (1UL << (_PAD))) {                                   \
+            touch_pad_read_filtered((_PAD), &filt);                     \
+            bool pass = true;                                           \
+            if (_use_abs) pass = (filt < THR_ABS);                      \
+            if (pass) {                                                 \
+                if ((t - (_st).last_ms) >= DEBOUNCE_MS) {               \
+                    (_st).last_ms = t;                                  \
+                    _onhit;                                             \
+                }                                                       \
+            }                                                           \
+        }                                                               \
+    } while (0)
+
+    // A: injeta carga (usa THR_ABS)
+    HANDLE_PAD(PAD_INJECAO_LOAD, stA, false, {
+        BaseType_t w = pdFALSE;
+        xSemaphoreGiveFromISR(semLoad, &w);
+        if (w) portYIELD_FROM_ISR();
+    });
+
+    // B: detecção de objeto → evento para SORT_ACT (usa THR_ABS)
+    HANDLE_PAD(PAD_DETEC_OBJETO, stB, false, {
+        BaseType_t w = pdFALSE;
+        uint32_t ts = t;
+        xQueueSendFromISR(qSORTevt, &ts, &w);
+        if (w) portYIELD_FROM_ISR();
+    });
+
+    // C: HMI/telemetria → **sem THR_ABS**, só threshold relativo + debounce
+    HANDLE_PAD(PAD_HMI, stC, false, {
+        g_hmi_flag = true;
+    });
+
+    // D: E-stop → acorda SAFETY_TASK imediatamente (usa THR_ABS)
+    HANDLE_PAD(PAD_STOP, stD, false, {
+        BaseType_t w = pdFALSE;
+        vTaskNotifyGiveFromISR(sSAFE, &w);
+        if (w) portYIELD_FROM_ISR();
+    });
+
+    #undef HANDLE_PAD
+}
+
+//===================== init de um pad =========================================
+static void touch_init_pad(touch_pad_t pad, touch_state_t *st)
+{
+    ESP_ERROR_CHECK(touch_pad_config(pad, 0));
+    vTaskDelay(pdMS_TO_TICKS(30));
+
+    // mede baseline filtrado
+    uint32_t acc = 0; uint16_t v=0;
+    for (int i=0;i<10;i++){ touch_pad_read_filtered(pad,&v); acc+=v; vTaskDelay(pdMS_TO_TICKS(5)); }
+    uint16_t base = acc/10;
+    uint16_t thr  = (uint16_t)(base * THR_RATIO);
+    ESP_ERROR_CHECK(touch_pad_set_thresh(pad, thr));
+    st->last_ms = 0;
+    ESP_EARLY_LOGI(TAG, "T%d baseline=%u thr=%u (~%.0f%%)", pad, base, thr, THR_RATIO*100.0f);
+}
+
+//===================== init geral dos touch ===================================
+static void touch_init_all(void)
+{
+    ESP_ERROR_CHECK(touch_pad_init());
+    ESP_ERROR_CHECK(touch_pad_set_fsm_mode(TOUCH_FSM_MODE_TIMER));
+    ESP_ERROR_CHECK(touch_pad_set_voltage(TOUCH_HVOLT_2V7, TOUCH_LVOLT_0V5, TOUCH_HVOLT_ATTEN_1V));
+    ESP_ERROR_CHECK(touch_pad_filter_start(FILTER_MS));
+
+    touch_init_pad(PAD_INJECAO_LOAD, &stA);
+    touch_init_pad(PAD_DETEC_OBJETO, &stB);
+    touch_init_pad(PAD_HMI, &stC);
+    touch_init_pad(PAD_STOP, &stD);
+
+    ESP_ERROR_CHECK(touch_pad_set_trigger_mode(TOUCH_TRIGGER_BELOW));
+    ESP_ERROR_CHECK(touch_pad_isr_register(touch_isr, NULL));
+    touch_pad_clear_status();
+    touch_pad_intr_enable();
+}
+
+//===================== Timer de 5 ms para ENC_SENSE ===========================
+static void enc_timer_cb(void *arg)
+{
+    // esp_timer roda em contexto de tarefa do sistema (não ISR)
+    if (sENC) {
+        xTaskNotifyGive(sENC);
+    }
+}
+
+//===================== Task 1: ENC_SENSE (T=5ms; D=5ms) ======================
+static void task_enc_sense(void *pv)
+{
+    float pos_deg = 0.0f;
+
+    for (;;) {
+        // espera o "tic" preciso de 5 ms vindo do esp_timer
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+        // marca início para medir C (em ms)
+        uint32_t tms        = now_ms();
+        uint32_t t0_us      = (uint32_t)esp_timer_get_time();
+
+        // ----------------- TRECHO CRÍTICO (execução da medição) ----------------
+        float rpm = g_pwm_duty * 3000.0f;            // 0..3000 RPM (simulado)
+        float deg_per_ms = (rpm * 360.0f) / (60.0f * 1000.0f);
+        pos_deg += deg_per_ms * ENC_PERIOD_MS;       // 5 ms por amostra
+        while (pos_deg >= 360.0f) pos_deg -= 360.0f;
+
+        enc_sample_t s = { .t_ms = tms, .rpm_est = rpm, .pos_deg = pos_deg };
+        (void)xQueueSend(qENCtoSPD, &s, 0);          // encadeia SPD_CTRL
+        // ----------------- FIM TRECHO CRÍTICO ----------------------------------
+
+        // mede C (ms) e verifica deadline (ms)
+        uint32_t t1_us   = (uint32_t)esp_timer_get_time();
+        uint32_t C_ms    = (now_ms() - tms);
+
+        if (C_ms > enc_sense_c_ms_max) enc_sense_c_ms_max = C_ms;
+        if (C_ms < enc_sense_c_ms_min) enc_sense_c_ms_min = C_ms;
+
+        bool deadline_miss = (C_ms > ENC_DEADLINE_MS);
+        if (deadline_miss) {
+            enc_sense_miss_counter++;
+            ESP_LOGI(TAG, "[ENC_SENSE] deadline miss: C=%u ms (> %u ms) (misses=%u)",
+                           C_ms, ENC_DEADLINE_MS, enc_sense_miss_counter);
+        } else if (C_ms > ENC_BUDGET_MS) {
+            ESP_LOGI(TAG, "[ENC_SENSE] acima do budget: C=%u ms (budget=%u ms)",
+                           C_ms, ENC_BUDGET_MS);
+        }
+    }
+}
+
+//===================== Task 2: SPD_CTRL (encadeada; D=10ms) ===================
+static void task_spd_ctrl(void *pv)
+{
+    enc_sample_t s;
+    // Ganhos e limites do PI
+    const float ref_rpm = 1500.0f;
+    const float Kp = 0.0015f, Ki = 0.0003f;
+    const float Ts = (float)ENC_PERIOD_MS / 1000.0f; // 0.005 s
+    const float DUTY_MIN = 0.0f, DUTY_MAX = 1.0f;
+    const float INTEG_MIN = -2.0f, INTEG_MAX = 2.0f; // janela de anti-windup
+
+    float integ = 0.0f;
+
+    for (;;)
+    {
+        // 1) BLOQUEIA esperando ao menos 1 amostra do encoder
+        if (xQueueReceive(qENCtoSPD, &s, portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+
+        uint32_t t0_us = (uint32_t)esp_timer_get_time();
+
+        // ---------------------- TRECHO CRÍTICO (controle) ----------------------
+        float err = ref_rpm - s.rpm_est;
+
+        // PI discreto: integ(k) = clamp( integ(k-1) + Ki*Ts*err )
+        integ += Ki * Ts * err;
+        if (integ > INTEG_MAX) integ = INTEG_MAX;
+        if (integ < INTEG_MIN) integ = INTEG_MIN;
+
+        float u = Kp * err + integ;
+
+        float duty = g_pwm_duty + u;
+        if (duty > DUTY_MAX) duty = DUTY_MAX;
+        if (duty < DUTY_MIN) duty = DUTY_MIN;
+
+        // “Atualiza PWM” (simulado)
+        g_pwm_duty = duty;
+        // ---------------------- FIM TRECHO CRÍTICO -----------------------------
+
+        // 4) Deadline absoluto: 10 ms desde o timestamp do sample ENC
+        uint32_t age_ms = now_ms() - s.t_ms;  // latência ENC→SPD
+        bool deadline_ok = (age_ms <= SPD_DEADLINE_MS);
+
+        // 5) HMI/telemetria — independente da deadline
+        if (g_hmi_flag) {
+            g_hmi_flag = false;
+            ESP_LOGI(TAG, "[HMI] rpm=%.0f pos=%.1f duty=%.2f", s.rpm_est, s.pos_deg, g_pwm_duty);
+        }
+
+        // 6) Medição de C em ms
+        uint32_t t1_us = (uint32_t)esp_timer_get_time();
+
+        if (age_ms > spd_control_c_ms_max) spd_control_c_ms_max = age_ms;
+        if (age_ms < spd_control_c_ms_min) spd_control_c_ms_min = age_ms;
+
+        if (!deadline_ok) {
+            spd_control_miss_counter++;
+            ESP_LOGI(TAG, "[SPD_CTRL] deadline miss: %u ms (> %u ms)",
+                           age_ms, SPD_DEADLINE_MS);
+        }
+    }
+}
+
+//===================== Task 3: SORT_ACT (evento; D=10ms) ======================
+static void task_sort_act(void *pv)
+{
+    uint32_t ts; // timestamp do toque B
+
+    for (;;) {
+        if (xQueueReceive(qSORTevt, &ts, portMAX_DELAY) == pdTRUE) {
+            // Para o demo: aciona imediatamente e conta produção.
+            ESP_LOGI(TAG, "[SORT_ACT] Solenoide ON");
+            g_sort_pulses++;
+            vTaskDelay(pdMS_TO_TICKS(20)); // pulso de 20ms
+            ESP_LOGI(TAG, "[SORT_ACT] Solenoide OFF");
+
+            uint32_t elapsed_ms = now_ms() - ts;   // latência evento→ação (ms)
+            if (elapsed_ms > sort_act_c_ms_max) sort_act_c_ms_max = elapsed_ms;
+            if (elapsed_ms < sort_act_c_ms_min) sort_act_c_ms_min = elapsed_ms;
+            if (elapsed_ms > SORT_DEADLINE_MS) {
+                sort_act_miss_counter++;
+                ESP_EARLY_LOGW(TAG, "[SORT_ACT] deadline miss: %u ms", elapsed_ms);
+            }
+            ESP_LOGI(TAG, "[SORT_ACT] R=%u ms  max=%u ms  min=%u ms  misses=%u",
+                     elapsed_ms, sort_act_c_ms_max, sort_act_c_ms_min, sort_act_miss_counter);
+        }
+    }
+}
+
+//===================== Task 4: SAFETY_TASK (evento; D=5ms) ====================
+static void task_safety(void *pv)
+{
+    for (;;) {
+        ulTaskNotifyTake(pdTRUE, portMAX_DELAY); // acordada pela ISR do Touch D
+        uint32_t t0_us = (uint32_t)esp_timer_get_time();
+
+        // Ação imediata: zera PWM e sinaliza alarme
+        g_pwm_duty = 0.0f;
+        g_alarm = !g_alarm;
+
+        // tempo de resposta em ms
+        uint32_t t1_us = (uint32_t)esp_timer_get_time();
+        uint32_t C_ms  = (t1_us - t0_us) / 1000U;
+
+        if (C_ms > safety_c_ms_max) safety_c_ms_max = C_ms;
+        if (C_ms < safety_c_ms_min) safety_c_ms_min = C_ms;
+        if (C_ms > SAFE_DEADLINE_MS) {
+            safety_miss_counter++;
+            ESP_EARLY_LOGW(TAG, "[SAFETY] deadline miss: %u ms (> %u ms)",
+                           C_ms, SAFE_DEADLINE_MS);
+        }
+        ESP_EARLY_LOGE(TAG, "[SAFETY] E-STOP! PWM=0, Alarme=%s", g_alarm ? "ON" : "OFF");
+        ESP_LOGI(TAG, "[SAFETY] C=%u ms  max=%u ms  min=%u ms  misses=%u",
+                 C_ms, safety_c_ms_max, safety_c_ms_min, safety_miss_counter);
+    }
+}
+
+//===================== Task opcional: injeção de carga (Touch A) ==============
+static void burn_cpu_ms(uint32_t ms)
+{
+    uint64_t end = esp_timer_get_time() + (uint64_t)ms*1000ULL;
+    volatile uint32_t x=0;
+    while (esp_timer_get_time() < end) { x = x*1664525u + 1013904223u; }
+    (void)x;
+}
+
+static void task_load(void *pv)
+{
+    for (;;) {
+        if (xSemaphoreTake(semLoad, portMAX_DELAY) == pdTRUE) {
+            ESP_LOGI(TAG, "[LOAD] Pico de CPU (~3 ms)");
+            burn_cpu_ms(3);
+        }
+    }
+}
+
+//===================== app_main ===============================================
+void app_main(void)
+{
+    // Filas/semaf.
+    qENCtoSPD = xQueueCreate(16, sizeof(enc_sample_t));
+    qSORTevt  = xQueueCreate(8, sizeof(uint32_t));
+    semLoad   = xSemaphoreCreateCounting(16, 0);
+
+    // Touch
+    touch_init_all();
+
+    // Tarefas (prioridades: SAFETY > ENC > SPD > SORT > LOAD)
+    xTaskCreate(task_enc_sense, "ENC_SENSE",  2048, NULL, 23, &sENC);
+    xTaskCreate(task_spd_ctrl,  "SPD_CTRL",   3072, NULL, 22, &sSPD);
+    xTaskCreate(task_sort_act,  "SORT_ACT",   2048, NULL, 21, &sSORT);
+    xTaskCreate(task_safety,    "SAFETY_TASK",2048, NULL, 24, &sSAFE);
+    xTaskCreate(task_load,      "LOAD",       2048, NULL,  24, &sLOAD);
+
+
+
+    // Timer periódico de 5 ms para ENC_SENSE (API do timer recebe micros)
+    const esp_timer_create_args_t enc_args = {
+        .callback = &enc_timer_cb,
+        .name = "enc_5ms"
+    };
+    ESP_ERROR_CHECK(esp_timer_create(&enc_args, &sEncTimer));
+    ESP_ERROR_CHECK(esp_timer_start_periodic(sEncTimer, 5000)); // 5000 us = 5 ms
+
+    for (;;) {
+        // Exemplo: imprime stats somente quando há alarme ativo (ajuste como preferir)
+        if (g_alarm){
+            ESP_LOGI(TAG, "[ENC_SENSE] stats: min=%u ms  max=%u ms  misses=%u", enc_sense_c_ms_min, enc_sense_c_ms_max, enc_sense_miss_counter);
+            ESP_LOGI(TAG, "[SPD_CTRL]  stats: min=%u ms  max=%u ms  misses=%u", spd_control_c_ms_min, spd_control_c_ms_max, spd_control_miss_counter);
+            ESP_LOGI(TAG, "[SORT_ACT]  stats: min=%u ms  max=%u ms  misses=%u", sort_act_c_ms_min,   sort_act_c_ms_max,   sort_act_miss_counter);
+            ESP_LOGI(TAG, "[SAFETY]    stats: min=%u ms  max=%u ms  misses=%u", safety_c_ms_min,     safety_c_ms_max,     safety_miss_counter);
+        }
+        vTaskDelay(pdMS_TO_TICKS(500));
+    }
+}
